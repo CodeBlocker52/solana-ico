@@ -1,12 +1,16 @@
 use anchor_lang::prelude::*;
-
 use anchor_lang::system_program::{transfer, Transfer as SystemTransfer};
 use anchor_spl::{
     associated_token::AssociatedToken,
     token::{self, Mint, Token, TokenAccount, Transfer},
 };
+use pyth_solana_receiver_sdk::price_update::{get_feed_id_from_hex, PriceUpdateV2};
 
 declare_id!("GsShB9qNbSRFFDCZjr5zMFraTV3wWgbjuXQiiJ6AnVq4");
+
+// Pyth SOL/USD price feed ID (mainnet)
+// For devnet, use: "0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d"
+const SOL_USD_PRICE_FEED_ID: &str = "0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d";
 
 #[program]
 pub mod ico_token_sale {
@@ -15,27 +19,30 @@ pub mod ico_token_sale {
     /// Initialize the ICO sale with parameters
     pub fn initialize_sale(
         ctx: Context<InitializeSale>,
-        token_price: u64,   // Price per token in SOL (lamports)
-        max_tokens: u64,    // Maximum tokens to sell
-        min_purchase: u64,  // Minimum token purchase amount
-        max_purchase: u64,  // Maximum token purchase per wallet
-        sale_duration: i64, // Sale duration in seconds
+        token_price_usd: u64,  // Price per token in USD (with 8 decimals, e.g., 100000000 = $1.00)
+        max_tokens: u64,       // Maximum tokens to sell
+        min_purchase: u64,     // Minimum token purchase amount
+        max_purchase: u64,     // Maximum token purchase per wallet
+        sale_duration: i64,    // Sale duration in seconds
+        max_age: u64,          // Maximum age of price feed in seconds
     ) -> Result<()> {
         let sale = &mut ctx.accounts.sale;
         let clock = Clock::get()?;
 
-        require!(token_price > 0, ErrorCode::InvalidPrice);
+        require!(token_price_usd > 0, ErrorCode::InvalidPrice);
         require!(max_tokens > 0, ErrorCode::InvalidAmount);
         require!(
             min_purchase > 0 && min_purchase <= max_purchase,
             ErrorCode::InvalidPurchaseLimit
         );
         require!(sale_duration > 0, ErrorCode::InvalidDuration);
+        require!(max_age > 0 && max_age <= 3600, ErrorCode::InvalidMaxAge); // Max 1 hour
 
         sale.authority = ctx.accounts.authority.key();
         sale.token_mint = ctx.accounts.token_mint.key();
         sale.treasury = ctx.accounts.treasury.key();
-        sale.token_price = token_price;
+        sale.pyth_price_update = ctx.accounts.pyth_price_update.key();
+        sale.token_price_usd = token_price_usd;
         sale.max_tokens = max_tokens;
         sale.min_purchase = min_purchase;
         sale.max_purchase = max_purchase;
@@ -43,6 +50,7 @@ pub mod ico_token_sale {
         sale.total_raised = 0;
         sale.start_time = clock.unix_timestamp;
         sale.end_time = clock.unix_timestamp + sale_duration;
+        sale.max_price_age = max_age;
         sale.is_active = true;
         sale.is_paused = false;
         sale.bump = ctx.bumps.sale;
@@ -51,7 +59,7 @@ pub mod ico_token_sale {
             sale: sale.key(),
             authority: sale.authority,
             token_mint: sale.token_mint,
-            token_price,
+            token_price_usd,
             max_tokens,
             start_time: sale.start_time,
             end_time: sale.end_time,
@@ -87,9 +95,21 @@ pub mod ico_token_sale {
             ErrorCode::ExceedsMaxTokens
         );
 
+        // Get SOL/USD price from Pyth
+        let price_update = &ctx.accounts.pyth_price_update;
+        let sol_usd_price = get_sol_usd_price(price_update, sale.max_price_age, clock.unix_timestamp)?;
+
         // Calculate SOL cost
-        let sol_cost = token_amount
-            .checked_mul(sale.token_price)
+        // token_price_usd has 8 decimals, sol_usd_price has 8 decimals
+        // Result should be in lamports (9 decimals for SOL)
+        let usd_cost = token_amount
+            .checked_mul(sale.token_price_usd)
+            .ok_or(ErrorCode::MathOverflow)?;
+
+        let sol_cost = usd_cost
+            .checked_mul(1_000_000_000) // Convert to lamports (9 decimals)
+            .ok_or(ErrorCode::MathOverflow)?
+            .checked_div(sol_usd_price)
             .ok_or(ErrorCode::MathOverflow)?;
 
         // Check user's purchase limit
@@ -147,6 +167,7 @@ pub mod ico_token_sale {
             buyer: ctx.accounts.buyer.key(),
             token_amount,
             sol_cost,
+            sol_usd_price,
             total_tokens_sold: sale.tokens_sold,
             total_raised: sale.total_raised,
         });
@@ -233,10 +254,11 @@ pub mod ico_token_sale {
     /// Update sale parameters (authority only, before sale starts)
     pub fn update_sale_params(
         ctx: Context<UpdateSaleParams>,
-        new_price: Option<u64>,
+        new_price_usd: Option<u64>,
         new_max_tokens: Option<u64>,
         new_min_purchase: Option<u64>,
         new_max_purchase: Option<u64>,
+        new_max_age: Option<u64>,
     ) -> Result<()> {
         let sale = &mut ctx.accounts.sale;
         let clock = Clock::get()?;
@@ -246,9 +268,9 @@ pub mod ico_token_sale {
             ErrorCode::SaleAlreadyStarted
         );
 
-        if let Some(price) = new_price {
+        if let Some(price) = new_price_usd {
             require!(price > 0, ErrorCode::InvalidPrice);
-            sale.token_price = price;
+            sale.token_price_usd = price;
         }
 
         if let Some(max_tokens) = new_max_tokens {
@@ -266,6 +288,11 @@ pub mod ico_token_sale {
             sale.max_purchase = max_purchase;
         }
 
+        if let Some(max_age) = new_max_age {
+            require!(max_age > 0 && max_age <= 3600, ErrorCode::InvalidMaxAge);
+            sale.max_price_age = max_age;
+        }
+
         require!(
             sale.min_purchase <= sale.max_purchase,
             ErrorCode::InvalidPurchaseLimit
@@ -273,14 +300,33 @@ pub mod ico_token_sale {
 
         emit!(SaleParamsUpdated {
             sale: sale.key(),
-            token_price: sale.token_price,
+            token_price_usd: sale.token_price_usd,
             max_tokens: sale.max_tokens,
             min_purchase: sale.min_purchase,
             max_purchase: sale.max_purchase,
+            max_price_age: sale.max_price_age,
         });
 
         Ok(())
     }
+}
+
+// Helper function to get SOL/USD price from Pyth
+fn get_sol_usd_price(price_update: &PriceUpdateV2, max_age: u64, current_time: i64) -> Result<u64> {
+    let sol_usd_feed_id = get_feed_id_from_hex(SOL_USD_PRICE_FEED_ID)?;
+    let price_feed = price_update.get_price_no_older_than(&Clock::get()?, max_age, &sol_usd_feed_id)?;
+    
+    require!(price_feed.price > 0, ErrorCode::InvalidPriceData);
+    
+    // Convert price to u64 with 8 decimal places
+    // Pyth price comes with different exponent, normalize to 8 decimals
+    let price = if price_feed.exponent >= -8 {
+        (price_feed.price as u64) * 10_u64.pow((price_feed.exponent + 8) as u32)
+    } else {
+        (price_feed.price as u64) / 10_u64.pow((-price_feed.exponent - 8) as u32)
+    };
+    
+    Ok(price)
 }
 
 #[derive(Accounts)]
@@ -302,6 +348,8 @@ pub struct InitializeSale<'info> {
     /// CHECK: Treasury account to receive SOL payments
     pub treasury: AccountInfo<'info>,
 
+    pub pyth_price_update: Account<'info, PriceUpdateV2>,
+
     pub system_program: Program<'info, System>,
     pub rent: Sysvar<'info, Rent>,
 }
@@ -312,14 +360,15 @@ pub struct PurchaseTokens<'info> {
         mut,
         seeds = [b"sale", sale.authority.as_ref(), token_mint.key().as_ref()],
         bump = sale.bump,
-        has_one = token_mint @ ErrorCode::InvalidTokenMint
+        has_one = token_mint @ ErrorCode::InvalidTokenMint,
+        has_one = pyth_price_update @ ErrorCode::InvalidPriceUpdate
     )]
     pub sale: Account<'info, Sale>,
 
     #[account(
         init_if_needed,
         payer = buyer,
-        space = 8 + UserPurchase::INIT_SPACE, // discriminator + user + sale + tokens_purchased + sol_contributed + bump
+        space = 8 + UserPurchase::INIT_SPACE,
         seeds = [b"purchase", sale.key().as_ref(), buyer.key().as_ref()],
         bump
     )]
@@ -348,6 +397,8 @@ pub struct PurchaseTokens<'info> {
     /// CHECK: Treasury account (validated in sale state)
     #[account(mut, address = sale.treasury)]
     pub treasury: AccountInfo<'info>,
+
+    pub pyth_price_update: Account<'info, PriceUpdateV2>,
 
     pub token_program: Program<'info, Token>,
     pub associated_token_program: Program<'info, AssociatedToken>,
@@ -432,14 +483,16 @@ pub struct Sale {
     pub authority: Pubkey,
     pub token_mint: Pubkey,
     pub treasury: Pubkey,
-    pub token_price: u64,
+    pub pyth_price_update: Pubkey,
+    pub token_price_usd: u64,    // Price per token in USD (8 decimals)
     pub max_tokens: u64,
     pub min_purchase: u64,
     pub max_purchase: u64,
     pub tokens_sold: u64,
-    pub total_raised: u64,
+    pub total_raised: u64,       // Total SOL raised in lamports
     pub start_time: i64,
     pub end_time: i64,
+    pub max_price_age: u64,      // Maximum age of price feed in seconds
     pub is_active: bool,
     pub is_paused: bool,
     pub bump: u8,
@@ -460,7 +513,7 @@ pub struct SaleInitialized {
     pub sale: Pubkey,
     pub authority: Pubkey,
     pub token_mint: Pubkey,
-    pub token_price: u64,
+    pub token_price_usd: u64,
     pub max_tokens: u64,
     pub start_time: i64,
     pub end_time: i64,
@@ -471,6 +524,7 @@ pub struct TokensPurchased {
     pub buyer: Pubkey,
     pub token_amount: u64,
     pub sol_cost: u64,
+    pub sol_usd_price: u64,
     pub total_tokens_sold: u64,
     pub total_raised: u64,
 }
@@ -498,10 +552,11 @@ pub struct TokensWithdrawn {
 #[event]
 pub struct SaleParamsUpdated {
     pub sale: Pubkey,
-    pub token_price: u64,
+    pub token_price_usd: u64,
     pub max_tokens: u64,
     pub min_purchase: u64,
     pub max_purchase: u64,
+    pub max_price_age: u64,
 }
 
 #[error_code]
@@ -516,6 +571,8 @@ pub enum ErrorCode {
     InvalidPurchaseLimit,
     #[msg("Invalid duration")]
     InvalidDuration,
+    #[msg("Invalid max age")]
+    InvalidMaxAge,
     #[msg("Sale is not active")]
     SaleInactive,
     #[msg("Sale is paused")]
@@ -538,4 +595,8 @@ pub enum ErrorCode {
     SaleAlreadyStarted,
     #[msg("Invalid token mint")]
     InvalidTokenMint,
+    #[msg("Invalid price update account")]
+    InvalidPriceUpdate,
+    #[msg("Invalid price data from Pyth")]
+    InvalidPriceData,
 }
